@@ -6,6 +6,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <Servo.h>
 
 #include <MS5837.h>
 
@@ -43,6 +44,10 @@
 
 // Hardware objects
 constexpr uint8_t LED_PIN = 13;
+
+constexpr uint8_t BALL_DROPPER_PIN = 12;
+
+Servo ball_dropper;
 
 // Thruster Allocation                                 
 LA::FloatMatrix allocation_matrix = {
@@ -130,6 +135,10 @@ rsla_interfaces__msg__PID pid_tuning_msg;
 rcl_subscription_t sw_arm_subscriber;
 std_msgs__msg__Bool sw_arm_msg;
 
+// Ball Dropper subscriber
+rcl_subscription_t ball_dropper_subscriber;
+std_msgs__msg__Int8 ball_dropper_msg;
+
 // Diagnostics subscriber
 rcl_subscription_t diagnostic_command_subscriber;
 std_msgs__msg__Int8 diagmonst_command_msg;
@@ -202,6 +211,137 @@ uint32_t pwm_write_interval_ms = 50; // 20Hz
 uint32_t last_sensor_update_ms = 0;
 uint32_t sensor_update_interval_ms = 50; // 20Hz
 bool new_sensor_data = false;
+
+
+//function declarations
+void error_loop();
+void status_callback(rcl_timer_t* timer, int64_t last_call_time);
+void orientation_callback(rcl_timer_t* timer, int64_t last_call_time);
+void telemetry_callback(rcl_timer_t* timer, int64_t last_call_time);
+void battery_voltage_callback(rcl_timer_t* timer, int64_t last_call_time);
+void ping_timer_callback(rcl_timer_t* timer, int64_t last_call_time);
+void pose_setpoint_callback(const void *msgin);
+void wrench_setpoint_callback(const void *msgin);
+void pid_tuning_callback(const void *msgin);
+void sw_arm_callback(const void *msgin);
+void diagnostic_command_callback(const void *msgin);
+bool create_entities();
+void destroy_entities();
+void initialize_sensors();
+void initialize_controllers();
+void initialize_message_data();
+void setup();
+void get_imu();
+void get_baro();
+void get_battery();
+void update_pids(float dt);
+void update_control_vector();
+void update_output_vectors();
+void control_ball_dropper();
+void output_to_pwm(uint32_t loop_time_millis);
+
+void loop() {
+  // Loop timing
+  uint32_t loop_time_millis = millis();
+  float dt = (float)(last_loop_ms - loop_time_millis) / 1000.f;
+  last_loop_ms = loop_time_millis;
+
+  if(node_state == NodeState::AGENT_CONNECTED)
+  {
+    digitalWriteFast(LED_PIN, loop_time_millis % 2000 > 1000);
+  }
+  else
+  {
+    digitalWriteFast(LED_PIN, 0);
+  }
+
+  // Main loop code
+  if(startup_successful)
+  {
+    if(loop_time_millis > last_sensor_update_ms + sensor_update_interval_ms)
+    {
+      last_sensor_update_ms = loop_time_millis;
+
+      get_imu();
+      get_baro();
+      get_battery();
+
+      new_sensor_data = true;
+    }
+    
+    if(new_sensor_data)
+    {
+      update_pids(dt);
+      new_sensor_data = false;
+    }
+
+    update_control_vector();
+
+    // Update thruster solution
+    thruster_solver.solve(control_vector);
+
+    update_output_vectors(); 
+    control_ball_dropper();
+    output_to_pwm(loop_time_millis);
+  }
+
+  // Spin ROS node
+  switch(node_state)
+  {
+    case NodeState::WAITING_AGENT:
+      EXECUTE_EVERY_N_MS(500, node_state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1) ? NodeState::AGENT_AVAILABLE : NodeState::WAITING_AGENT));
+      break;
+    case NodeState::AGENT_AVAILABLE:
+      node_state = (true == create_entities()) ? NodeState::AGENT_CONNECTED : NodeState::WAITING_AGENT;
+      break;
+    case NodeState::AGENT_CONNECTED:
+      EXECUTE_EVERY_N_MS(200, node_state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1) ? NodeState::AGENT_CONNECTED : NodeState::AGENT_DISCONNECTED));
+      if(node_state == NodeState::AGENT_CONNECTED)
+      {
+        RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(50)));
+      }
+      break;
+    case NodeState::AGENT_DISCONNECTED:
+      destroy_entities();
+      node_state = NodeState::WAITING_AGENT;
+      break;
+    default:
+      break;
+  }
+}
+
+
+
+
+//-----------Functions--------------------------------------------------------
+
+void setup() {
+  Wire.begin();
+
+  initialize_sensors();
+  
+  // Reset i2c clock after sensor startup
+  Wire.setClock(400000);
+
+  initialize_controllers();
+
+  // Initialize MicroROS transport
+  Serial.begin(1000000); // This doesn't actually care about the number
+  set_microros_serial_transports(Serial);
+  
+  while(!Serial) delay(10); // Loop until serial established
+
+  // Set up error indicators
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
+  delay(1000);
+  
+  initialize_message_data();
+
+  // Initial state
+  node_state = NodeState::WAITING_AGENT;
+}
 
 // Eternal loop for unrecoverable errors  
 void error_loop()
@@ -536,6 +676,9 @@ bool create_entities()
   // Create software arm subscriber
   RCCHECK(rclc_subscription_init_default(&sw_arm_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "rsla/controls/sw_arm"));
 
+  // Create ball dropper subscriber
+  RCCHECK(rclc_subscription_init_default(&ball_dropper_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int8), "rsla/controls/ball_dropper"));
+
   // Create diagnostic command subscriber
   RCCHECK(rclc_subscription_init_default(&diagnostic_command_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int8), "rsla/controls/diagnostic_command"));
 
@@ -584,10 +727,7 @@ void destroy_entities()
   RCCHECK(rclc_support_fini(&support));
 }
 
-void setup() {
-  // Initialize sensors
-  Wire.begin();
-
+void initialize_sensors() {
   if(!baro.init())
   {
     vehicle_state = VehicleState::BARO_ERROR;
@@ -636,10 +776,9 @@ void setup() {
     ADS.readADC(0);
   }
 
-  // Reset i2c clock after sensor startup
-  Wire.setClock(400000);
+}
 
-  // Initialize controllers
+void initialize_controllers() {
   yaw_controller.errorMode = RSLA::ErrorMode::ANGULAR;
 
   x_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
@@ -678,150 +817,95 @@ void setup() {
   yaw_controller.bias = 0.0;
   yaw_controller.constraint = 15.0;
   yaw_controller.enableConstraint = true;
+}
 
-  // Initialize MicroROS transport
-  Serial.begin(1000000); // This doesn't actually care about the number
-  set_microros_serial_transports(Serial);
-  
-  while(!Serial) delay(10); // Loop until serial established
-
-  // Set up error indicators
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
-
-  delay(1000);
-  
-  // Initialize message data default
+void initialize_message_data() {
   status_msg.data = 0;
-
   orientation_msg.orientation.yaw = 0;
   orientation_msg.orientation.pitch = 0;
   orientation_msg.orientation.roll = 0;
   orientation_msg.position.x = 0;
   orientation_msg.position.y = 0;
   orientation_msg.position.z = 0;
-
-  // Initial state
-  node_state = NodeState::WAITING_AGENT;
 }
 
-void loop() {
-  // Loop timing
-  uint32_t loop_time_millis = millis();
-  float dt = (float)(last_loop_ms - loop_time_millis) / 1000.f;
-  last_loop_ms = loop_time_millis;\
-
-  if(node_state == NodeState::AGENT_CONNECTED)
-  {
-    digitalWriteFast(LED_PIN, loop_time_millis % 2000 > 1000);
-  }
-  else
-  {
-    digitalWriteFast(LED_PIN, 0);
-  }
-
-  // Main loop code
-  if(startup_successful)
-  {
-    // Get IMU data
-    if(loop_time_millis > last_sensor_update_ms + sensor_update_interval_ms)
-    {
-      last_sensor_update_ms = loop_time_millis;
+void get_imu() {
       bno_euler_data = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
       yaw = bno_euler_data.x();
       pitch = bno_euler_data.y();
       roll = -bno_euler_data.z();
-
       bno.getCalibration(&bno_sys_cal, &bno_gyro_cal, &bno_acc_cal, &bno_mag_cal);
+}
 
-      // Get barometer data
-      baro.read();
-      baro_depth_data = baro.depth();
-      z = baro_depth_data - surface_offset;
+void get_baro() {
+  baro.read();
+  baro_depth_data = baro.depth();
+  z = baro_depth_data - surface_offset;
+}
 
-      // Get battery voltage
+void get_battery() {
 #ifdef DEBUG
-      battery_voltage = 16.8;
+  battery_voltage = 16.8;
 #else
-      battery_voltage = ADS.getValue() * (16.23 / 26796);
+  battery_voltage = ADS.getValue() * (16.23 / 26796);
 #endif
+}
 
-      new_sensor_data = true;
-    }
-    
-    // Update PIDs
-    if(new_sensor_data)
-    {
-      yaw_controller.update(yaw, dt);
-      pitch_controller.update(pitch, dt);
-      roll_controller.update(roll, dt);
-      x_controller.update(x, dt);
-      y_controller.update(y, dt);
-      z_controller.update(z, dt);
+void update_pids(float dt) {
+  yaw_controller.update(yaw, dt);
+  pitch_controller.update(pitch, dt);
+  roll_controller.update(roll, dt);
+  x_controller.update(x, dt);
+  y_controller.update(y, dt);
+  z_controller.update(z, dt);
+}
 
-      new_sensor_data = false;
-    }
+void update_control_vector() {
+  if (x_mode == ControllerMode::EFFORT) {
+    control_vector[0] = x_effort;
+  }
+  else {
+    control_vector[0] = x_controller.output;
+  }
 
-    // Update control vector
-    if(x_mode == ControllerMode::EFFORT)
-    {
-      control_vector[0] = x_effort;
-    }
-    else
-    {
-      control_vector[0] = x_controller.output;
-    }
+  if (y_mode == ControllerMode::EFFORT) {
+    control_vector[1] = y_effort;
+  }
+  else {
+    control_vector[1] = y_controller.output;
+  }
 
-    if(y_mode == ControllerMode::EFFORT)
-    {
-      control_vector[1] = y_effort;
-    }
-    else
-    {
-      control_vector[1] = y_controller.output;
-    }
+  if (z_mode == ControllerMode::EFFORT) {
+    control_vector[2] = z_effort;
+  }
+  else {
+    control_vector[2] = z_controller.output;
+  }
 
-    if(z_mode == ControllerMode::EFFORT)
-    {
-      control_vector[2] = z_effort;
-    }
-    else
-    {
-      control_vector[2] = z_controller.output;
-    }
+  if (roll_mode == ControllerMode::EFFORT) {
+    control_vector[3] = roll_effort;
+  }
+  else {
+    control_vector[3] = roll_controller.output;
+  }
 
-    if(roll_mode == ControllerMode::EFFORT)
-    {
-      control_vector[3] = roll_effort;
-    }
-    else
-    {
-      control_vector[3] = roll_controller.output;
-    }
+  if (pitch_mode == ControllerMode::EFFORT) {
+    control_vector[4] = pitch_effort;
+  }
+  else {
+    control_vector[4] = pitch_controller.output;
+  }
 
-    if(pitch_mode == ControllerMode::EFFORT)
-    {
-      control_vector[4] = pitch_effort;
-    }
-    else
-    {
-      control_vector[4] = pitch_controller.output;
-    }
+  if (yaw_mode == ControllerMode::EFFORT) {
+    control_vector[5] = yaw_effort;
+  }
+  else {
+    control_vector[5] = yaw_controller.output;
+  }
+}
 
-    if(yaw_mode == ControllerMode::EFFORT)
-    {
-      control_vector[5] = yaw_effort;
-    }
-    else
-    {
-      control_vector[5] = yaw_controller.output;
-    }
-
-    // Update thruster solution
-    thruster_solver.solve(control_vector);
-
-    // Update output vectors
-    if(vehicle_armed)
+void update_output_vectors() {
+  if(vehicle_armed)
     {
       for(int i = 0; i < 8; i++)
       {
@@ -837,9 +921,19 @@ void loop() {
         thruster_pwm[i] = 1500; // Output idle PWM when disarmed
       }
     }
+}
 
-    // Output to PWM driver
-    if(loop_time_millis > last_pwm_write_ms + pwm_write_interval_ms)
+void control_ball_dropper() {
+    switch (ball_dropper_msg.data) {
+        case 0: ball_dropper.write(90); break; // neutral
+        case 1: ball_dropper.write(135); break; // left ball
+        case 2: ball_dropper.write(45); break; // right ball
+        default: break;
+    }
+}
+
+void output_to_pwm(uint32_t loop_time_millis) {
+  if(loop_time_millis > last_pwm_write_ms + pwm_write_interval_ms)
     {
       last_pwm_write_ms = loop_time_millis;
 
@@ -848,29 +942,4 @@ void loop() {
         pwm_driver.writeMicroseconds(7 - i, thruster_pwm[i]);
       }
     }
-  }
-
-  // Spin ROS node
-  switch(node_state)
-  {
-    case NodeState::WAITING_AGENT:
-      EXECUTE_EVERY_N_MS(500, node_state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1) ? NodeState::AGENT_AVAILABLE : NodeState::WAITING_AGENT));
-      break;
-    case NodeState::AGENT_AVAILABLE:
-      node_state = (true == create_entities()) ? NodeState::AGENT_CONNECTED : NodeState::WAITING_AGENT;
-      break;
-    case NodeState::AGENT_CONNECTED:
-      EXECUTE_EVERY_N_MS(200, node_state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1) ? NodeState::AGENT_CONNECTED : NodeState::AGENT_DISCONNECTED));
-      if(node_state == NodeState::AGENT_CONNECTED)
-      {
-        RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(50)));
-      }
-      break;
-    case NodeState::AGENT_DISCONNECTED:
-      destroy_entities();
-      node_state = NodeState::WAITING_AGENT;
-      break;
-    default:
-      break;
-  }
 }
