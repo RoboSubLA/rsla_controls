@@ -8,8 +8,7 @@
 #include <Servo.h>
 #include <math.h>
 
-#include <MS5837.h>
-#include <ADS1X15.h>
+#include <ADS1115.h>
 
 #include <LibAlg.hpp>
 #include <PID.hpp>
@@ -66,8 +65,6 @@ enum class VehicleState : int8_t
 {
   ADC_ERROR = -4,
   PWM_ERROR = -3,
-  BARO_ERROR = -2,
-  IMU_ERROR = -1,
   IDLE = 0,
   ARMED = 1
 } vehicle_state;
@@ -164,10 +161,6 @@ rcl_node_t node;
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){}}
 
 // Sensor objects
-MS5837 baro(0x76, &Wire);
-float baro_depth_data = 0;
-float surface_offset = 0;
-
 Adafruit_PWMServoDriver pwm_driver(0x40);
 
 ADS1113 ADS(0x48);
@@ -239,7 +232,6 @@ void initialize_sensors();
 void initialize_controllers();
 void initialize_message_data();
 void setup();
-void get_baro();
 void get_battery();
 void update_pids(float dt);
 void update_control_vector();
@@ -268,8 +260,6 @@ void loop() {
     if(loop_time_millis > last_sensor_update_ms + sensor_update_interval_ms)
     {
       last_sensor_update_ms = loop_time_millis;
-    
-      get_baro();
       get_battery();
 
       new_sensor_data = true;
@@ -341,8 +331,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
 
-  delay(1000);
-
+  delay(1000);  
   initialize_message_data();
 
   // Initial state
@@ -372,12 +361,6 @@ void status_callback(rcl_timer_t* timer, int64_t last_call_time)
     {
       case VehicleState::PWM_ERROR:
         status = -3;
-        break;
-      case VehicleState::BARO_ERROR:
-        status = -2;
-        break;
-      case VehicleState::IMU_ERROR:
-        status = -1;
         break;
       case VehicleState::IDLE:
         status = 0;
@@ -570,7 +553,7 @@ void pid_tuning_callback(const void *msgin)
   
   float bias = msg->bias;
 
-  float constraint = msg->constraint;
+  float constraint = msg.constraint;
   bool enable_constraint = constraint > 0;
 
   RSLA::PID *controller;
@@ -641,10 +624,6 @@ void diagnostic_command_callback(const void *msgin)
   // Miscellatious diagnostic commands
   switch(msg->data)
   {
-    case 1:
-      // Reset surface offset
-      surface_offset = baro_depth_data;
-      break;
     default:
       break;
   }
@@ -654,33 +633,34 @@ void diagnostic_command_callback(const void *msgin)
 // DVL callback
 void dvl_callback(const void* msgin)
 {
-  const geometry_msgs__msg__Point* msg = (const geometry_msgs__msg__Point*)msgin;
-  x = msg->x;
-  y = msg->y;
+    const geometry_msgs__msg__Point* msg = (const geometry_msgs__msg__Point*)msgin;
+    x = msg->x;
+    y = msg->y;
+    z = msg->z;
 }
 
 // AHRS quaternion callback
 void quaternion_callback(const void* msgin)
 {
-  const geometry_msgs__msg__Quaternion* q = (const geometry_msgs__msg__Quaternion*)msgin;
+    const geometry_msgs__msg__Quaternion* q = (const geometry_msgs__msg__Quaternion*)msgin;
 
-  // Conversion to Euler Angles from Quaternion
-  // roll (x-axis rotation)
-  double sinr_cosp = 2 * (q->w * q->x + q->y * q->z);
-  double cosr_cosp = 1 - 2 * (q->x * q->x + q->y * q->y);
-  roll = atan2(sinr_cosp, cosr_cosp) * 180 / M_PI;
+    // Conversion to Euler Angles from Quaternion
+    // roll (x-axis rotation)
+    double sinr_cosp = 2 * (q->w * q->x + q->y * q->z);
+    double cosr_cosp = 1 - 2 * (q->x * q->x + q->y * q->y);
+    roll = atan2(sinr_cosp, cosr_cosp);
 
-  // pitch (y-axis rotation)
-  double sinp = 2 * (q->w * q->y - q->z * q->x);
-  if (abs(sinp) >= 1)
-      pitch = copysign(90, sinp); // use 90 degrees if out of range
-  else
-      pitch = asin(sinp) * 180 / M_PI;
+    // pitch (y-axis rotation)
+    double sinp = 2 * (q->w * q->y - q->z * q->x);
+    if (abs(sinp) >= 1)
+        pitch = copysign(M_PI / 2, sinp); // use 90 degrees if out of range
+    else
+        pitch = asin(sinp);
 
-  // yaw (z-axis rotation)
-  double siny_cosp = 2 * (q->w * q->z + q->x * q->y);
-  double cosy_cosp = 1 - 2 * (q->y * q->y + q->z * q->z);
-  yaw = atan2(siny_cosp, cosy_cosp) * 180 / M_PI;
+    // yaw (z-axis rotation)
+    double siny_cosp = 2 * (q->w * q->z + q->x * q->y);
+    double cosy_cosp = 1 - 2 * (q->y * q->y + q->z * q->z);
+    yaw = atan2(siny_cosp, cosy_cosp);
 }
 
 // Create ROS entities
@@ -777,16 +757,6 @@ void destroy_entities()
 }
 
 void initialize_sensors() {
-  if(!baro.init())
-  {
-    vehicle_state = VehicleState::BARO_ERROR;
-    startup_successful = false;
-  }
-  else
-  {
-    baro.setFluidDensity(997);
-  }
-
   delay(100);
 
   if(!pwm_driver.begin())
@@ -883,12 +853,6 @@ void initialize_message_data() {
   orientation_msg.position.x = 0;
   orientation_msg.position.y = 0;
   orientation_msg.position.z = 0;
-}
-
-void get_baro() {
-  baro.read();
-  baro_depth_data = baro.depth();
-  z = baro_depth_data - surface_offset;
 }
 
 void get_battery() {
