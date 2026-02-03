@@ -341,7 +341,8 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
 
-  delay(1000);  
+  delay(1000); 
+
   initialize_message_data();
 
   // Initial state
@@ -569,7 +570,7 @@ void pid_tuning_callback(const void *msgin)
   
   float bias = msg->bias;
 
-  float constraint = msg.constraint;
+  float constraint = msg->constraint;
   bool enable_constraint = constraint > 0;
 
   RSLA::PID *controller;
