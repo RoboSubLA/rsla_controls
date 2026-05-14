@@ -654,33 +654,33 @@ void diagnostic_command_callback(const void *msgin)
 // DVL callback
 void dvl_callback(const void* msgin)
 {
-    const geometry_msgs__msg__Point* msg = (const geometry_msgs__msg__Point*)msgin;
-    x = msg->x;
-    y = msg->y;
+  const geometry_msgs__msg__Point* msg = (const geometry_msgs__msg__Point*)msgin;
+  x = msg->x;
+  y = msg->y;
 }
 
 // AHRS quaternion callback
 void quaternion_callback(const void* msgin)
 {
-    const geometry_msgs__msg__Quaternion* q = (const geometry_msgs__msg__Quaternion*)msgin;
+  const geometry_msgs__msg__Quaternion* q = (const geometry_msgs__msg__Quaternion*)msgin;
 
-    // Conversion to Euler Angles from Quaternion
-    // roll (x-axis rotation)
-    double sinr_cosp = 2 * (q->w * q->x + q->y * q->z);
-    double cosr_cosp = 1 - 2 * (q->x * q->x + q->y * q->y);
-    roll = atan2(sinr_cosp, cosr_cosp);
+  // Conversion to Euler Angles from Quaternion
+  // roll (x-axis rotation)
+  double sinr_cosp = 2 * (q->w * q->x + q->y * q->z);
+  double cosr_cosp = 1 - 2 * (q->x * q->x + q->y * q->y);
+  roll = atan2(sinr_cosp, cosr_cosp) * 180 / M_PI;
 
-    // pitch (y-axis rotation)
-    double sinp = 2 * (q->w * q->y - q->z * q->x);
-    if (abs(sinp) >= 1)
-        pitch = copysign(M_PI / 2, sinp); // use 90 degrees if out of range
-    else
-        pitch = asin(sinp);
+  // pitch (y-axis rotation)
+  double sinp = 2 * (q->w * q->y - q->z * q->x);
+  if (abs(sinp) >= 1)
+      pitch = copysign(90, sinp); // use 90 degrees if out of range
+  else
+      pitch = asin(sinp) * 180 / M_PI;
 
-    // yaw (z-axis rotation)
-    double siny_cosp = 2 * (q->w * q->z + q->x * q->y);
-    double cosy_cosp = 1 - 2 * (q->y * q->y + q->z * q->z);
-    yaw = atan2(siny_cosp, cosy_cosp);
+  // yaw (z-axis rotation)
+  double siny_cosp = 2 * (q->w * q->z + q->x * q->y);
+  double cosy_cosp = 1 - 2 * (q->y * q->y + q->z * q->z);
+  yaw = atan2(siny_cosp, cosy_cosp) * 180 / M_PI;
 }
 
 // Create ROS entities
