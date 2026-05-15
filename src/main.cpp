@@ -341,7 +341,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
 
-  delay(1000); 
+  delay(1000);
 
   initialize_message_data();
 
