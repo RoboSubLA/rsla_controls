@@ -7,6 +7,7 @@
 #include <Adafruit_PWMServoDriver.h>
 #include <Servo.h>
 #include <math.h>
+#include <algorithm>
 
 #include <MS5837.h>
 #include <ADS1X15.h>
@@ -27,6 +28,7 @@
 #include <std_msgs/msg/float32.h>
 
 #include <geometry_msgs/msg/point.h>
+#include <geometry_msgs/msg/twist.h>
 #include <geometry_msgs/msg/quaternion.h>
 
 #include <rsla_interfaces/msg/euler_angles.h>
@@ -49,7 +51,11 @@ constexpr uint8_t LED_PIN = 13;
 
 constexpr uint8_t BALL_DROPPER_PIN = 12;
 
+constexpr uint8_t GRIPPER_PIN = 10;
+
 Servo ball_dropper;
+
+Servo gripper;
 
 // Thruster Allocation                                 
 LA::FloatMatrix allocation_matrix = {
@@ -84,9 +90,9 @@ bool startup_successful = true;
 bool vehicle_armed = false;
 
 float x = 0;
-float x_setpoint = 0;
+float vel_x = 0;
 float y = 0;
-float y_setpoint = 0;
+float vel_y = 0;
 float z = 0;
 
 float yaw = 0;
@@ -134,8 +140,11 @@ rsla_interfaces__msg__WrenchWithMask wrench_setpoint_msg;
 rcl_subscription_t quaternion_subscriber;
 geometry_msgs__msg__Quaternion quaternion_msg;
 
-rcl_subscription_t dvl_subscriber;
-geometry_msgs__msg__Point dvl_msg;
+rcl_subscription_t dvl_point_subscriber;
+geometry_msgs__msg__Point dvl_point_msg;
+
+rcl_subscription_t dvl_twist_subscriber;
+geometry_msgs__msg__Twist dvl_twist_msg;
 
 // Tuning subscriber
 rcl_subscription_t pid_tuning_subscriber;
@@ -148,6 +157,10 @@ std_msgs__msg__Bool sw_arm_msg;
 // Ball Dropper subscriber
 rcl_subscription_t ball_dropper_subscriber;
 std_msgs__msg__Int8 ball_dropper_msg;
+
+// Gripper subscriber
+rcl_subscription_t gripper_subscriber;
+std_msgs__msg__Int8 gripper_msg;
 
 // Diagnostics subscriber
 rcl_subscription_t diagnostic_command_subscriber;
@@ -188,9 +201,11 @@ ControllerMode roll_mode = ControllerMode::POSITION;
 ControllerMode pitch_mode = ControllerMode::POSITION;
 ControllerMode yaw_mode = ControllerMode::POSITION;
 
+RSLA::PID x_vel_controller(0, 0, 0);
+RSLA::PID y_vel_controller(0, 0, 0);
+RSLA::PID z_controller(0, 0, 0);
 RSLA::PID x_controller(0, 0, 0);
 RSLA::PID y_controller(0, 0, 0);
-RSLA::PID z_controller(0, 0, 0);
 RSLA::PID roll_controller(0, 0, 0);
 RSLA::PID pitch_controller(0, 0, 0);
 RSLA::PID yaw_controller(0, 0, 0);
@@ -214,6 +229,9 @@ uint32_t last_loop_ms = 0;
 uint32_t last_pwm_write_ms = 0;
 uint32_t pwm_write_interval_ms = 50; // 20Hz
 
+uint32_t last_grip_msg_ms = 0;
+uint32_t grip_hold_ms = 2500;
+
 uint32_t last_sensor_update_ms = 0;
 uint32_t sensor_update_interval_ms = 50; // 20Hz
 bool new_sensor_data = false;
@@ -232,7 +250,8 @@ void pid_tuning_callback(const void *msgin);
 void sw_arm_callback(const void *msgin);
 void diagnostic_command_callback(const void *msgin);
 void quaternion_callback(const void* msgin);
-void dvl_callback(const void* msgin);
+void dvl_point_callback(const void* msgin);
+void dvl_twist_callback(const void* msgin);
 bool create_entities();
 void destroy_entities();
 void initialize_sensors();
@@ -245,6 +264,7 @@ void update_pids(float dt);
 void update_control_vector();
 void update_output_vectors();
 void control_ball_dropper();
+void control_gripper(uint32_t loop_time_millis);
 void output_to_pwm(uint32_t loop_time_millis);
 
 void loop() {
@@ -288,6 +308,7 @@ void loop() {
 
     update_output_vectors(); 
     control_ball_dropper();
+    control_gripper(loop_time_millis);
     output_to_pwm(loop_time_millis);
   }
 
@@ -344,6 +365,9 @@ void setup() {
   delay(1000);
 
   initialize_message_data();
+
+  ball_dropper.attach(BALL_DROPPER_PIN);
+  gripper.attach(GRIPPER_PIN);
 
   // Initial state
   node_state = NodeState::WAITING_AGENT;
@@ -475,13 +499,13 @@ void pose_setpoint_callback(const void *msgin)
   if(msg->mask & 1)
   {
     x_mode = ControllerMode::POSITION;
-    x_setpoint = msg->cmd.position.x;
+    x_controller.setpoint = msg->cmd.position.x;
   }
   // Y controller
   if(msg->mask & 2)
   {
     y_mode = ControllerMode::POSITION;
-    y_setpoint = msg->cmd.position.y;
+    y_controller.setpoint = msg->cmd.position.y;
   }
   // Z controller
   if(msg->mask & 4)
@@ -578,10 +602,10 @@ void pid_tuning_callback(const void *msgin)
   switch(pid_index)
   {
     case 0:
-      controller = &x_controller;
+      controller = &x_vel_controller;
       break;
     case 1:
-      controller = &y_controller;
+      controller = &y_vel_controller;
       break;
     case 2:
       controller = &z_controller;
@@ -594,6 +618,12 @@ void pid_tuning_callback(const void *msgin)
       break;
     case 5:
       controller = &yaw_controller;
+      break;
+    case 6:
+      controller = &x_controller;
+      break;
+    case 7:
+      controller = &y_controller;
       break;
     default:
       return;
@@ -622,15 +652,27 @@ void sw_arm_callback(const void *msgin)
   // If vehicle previously disarmed, reset PID integrals
   if(new_arm && !vehicle_armed)
   {
+    x_vel_controller.zeroIntegrator();
+    y_vel_controller.zeroIntegrator();
+    z_controller.zeroIntegrator();
     x_controller.zeroIntegrator();
     y_controller.zeroIntegrator();
-    z_controller.zeroIntegrator();
     roll_controller.zeroIntegrator();
     pitch_controller.zeroIntegrator();
     yaw_controller.zeroIntegrator();
   }
 
   vehicle_armed = new_arm;
+}
+
+void ball_dropper_callback(const void *msgin){
+  const std_msgs__msg__Int8 *msg = (const std_msgs__msg__Int8*) msgin;
+  ball_dropper_msg = *msg;
+}
+
+void gripper_callback(const void *msgin){
+  const std_msgs__msg__Int8 *msg = (const std_msgs__msg__Int8*) msgin;
+  gripper_msg = *msg;
 }
 
 // Diagnostic command callback
@@ -650,13 +692,20 @@ void diagnostic_command_callback(const void *msgin)
   }
 }
 
-
-// DVL callback
-void dvl_callback(const void* msgin)
+// DVL point callback
+void dvl_point_callback(const void* msgin)
 {
   const geometry_msgs__msg__Point* msg = (const geometry_msgs__msg__Point*)msgin;
   x = msg->x;
   y = msg->y;
+}
+
+// DVL twist Callback
+void dvl_twist_callback(const void* msgin)
+{
+  const geometry_msgs__msg__Twist* msg = (const geometry_msgs__msg__Twist*)msgin;
+  vel_x = msg->linear.x;
+  vel_y = msg->linear.y;
 }
 
 // AHRS quaternion callback
@@ -713,7 +762,8 @@ bool create_entities()
 
   // Create AHRS and DVL subscribers
   RCCHECK(rclc_subscription_init_default(&quaternion_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Quaternion), "/ahrs/quaternion"));
-  RCCHECK(rclc_subscription_init_default(&dvl_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Point), "/dvl/point"));
+  RCCHECK(rclc_subscription_init_default(&dvl_point_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Point), "/dvl/point"));
+  RCCHECK(rclc_subscription_init_default(&dvl_twist_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "/dvl/twist"));
 
   // Create tuning subscriber
   RCCHECK(rclc_subscription_init_default(&pid_tuning_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(rsla_interfaces, msg, PID), "rsla/controls/pid_controller_gains"));
@@ -724,11 +774,14 @@ bool create_entities()
   // Create ball dropper subscriber
   RCCHECK(rclc_subscription_init_default(&ball_dropper_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int8), "rsla/controls/ball_dropper"));
 
+  // Create gripper subscriber
+  RCCHECK(rclc_subscription_init_default(&gripper_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int8), "rsla/controls/gripper"));
+
   // Create diagnostic command subscriber
   RCCHECK(rclc_subscription_init_default(&diagnostic_command_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int8), "rsla/controls/diagnostic_command"));
 
   // Create executor
-  RCCHECK(rclc_executor_init(&executor, &support.context, 12, &allocator));
+  RCCHECK(rclc_executor_init(&executor, &support.context, 14, &allocator));
 
   // Add timers to executor
   RCCHECK(rclc_executor_add_timer(&executor, &status_timer));
@@ -740,9 +793,12 @@ bool create_entities()
   RCCHECK(rclc_executor_add_subscription(&executor, &pose_setpoint_subscriber, &pose_setpoint_msg, &pose_setpoint_callback, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&executor, &wrench_setpoint_subscriber, &wrench_setpoint_msg, &wrench_setpoint_callback, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&executor, &quaternion_subscriber, &quaternion_msg, &quaternion_callback, ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_subscription(&executor, &dvl_subscriber, &dvl_msg, &dvl_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &dvl_point_subscriber, &dvl_point_msg, &dvl_point_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &dvl_twist_subscriber, &dvl_twist_msg, &dvl_twist_callback, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&executor, &pid_tuning_subscriber, &pid_tuning_msg, &pid_tuning_callback, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&executor, &sw_arm_subscriber, &sw_arm_msg, &sw_arm_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &ball_dropper_subscriber, &ball_dropper_msg, &ball_dropper_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &gripper_subscriber, &gripper_msg, &gripper_callback, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&executor, &diagnostic_command_subscriber, &diagmonst_command_msg, &diagnostic_command_callback, ON_NEW_DATA));
 
   return true;
@@ -766,7 +822,8 @@ void destroy_entities()
   RCCHECK(rcl_subscription_fini(&pose_setpoint_subscriber, &node));
   RCCHECK(rcl_subscription_fini(&wrench_setpoint_subscriber, &node));
   RCCHECK(rcl_subscription_fini(&quaternion_subscriber, &node));
-  RCCHECK(rcl_subscription_fini(&dvl_subscriber, &node));
+  RCCHECK(rcl_subscription_fini(&dvl_point_subscriber, &node));
+  RCCHECK(rcl_subscription_fini(&dvl_twist_subscriber, &node));
   RCCHECK(rcl_subscription_fini(&pid_tuning_subscriber, &node));
   RCCHECK(rcl_subscription_fini(&sw_arm_subscriber, &node));
   RCCHECK(rcl_subscription_fini(&diagnostic_command_subscriber, &node));
@@ -819,31 +876,28 @@ void initialize_sensors() {
 void initialize_controllers() {
   yaw_controller.errorMode = RSLA::ErrorMode::ANGULAR;
 
+  x_vel_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
+  y_vel_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
+  z_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
+
   x_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
   y_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
-  z_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
   
   roll_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
   pitch_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
   yaw_controller.derivativeMode = RSLA::DerivativeMode::DERIVATIVE_ON_MEASUREMENT;
 
-  x_controller.kP = 30.0;
-  x_controller.kI = 1.0;
-  x_controller.kD = 10.0;
-  x_controller.antiwindup = 2.0;
-  x_controller.enableAntiwindup = true;
-  x_controller.bias = 0.0;
-  x_controller.constraint = 15.0;
-  x_controller.enableConstraint = true;
+  x_vel_controller.kP = 200.0; // set to reach 0.25 max speed
+  x_vel_controller.kI = 0.0;
+  x_vel_controller.kD = 0.0;
+  x_vel_controller.constraint = 30.0;
+  x_vel_controller.enableConstraint = true;
 
-  y_controller.kP = 30.0;
-  y_controller.kI = 1.0;
-  y_controller.kD = 10.0;
-  y_controller.antiwindup = 2.0;
-  y_controller.enableAntiwindup = true;
-  y_controller.bias = 0.0;
-  y_controller.constraint = 15.0;
-  y_controller.enableConstraint = true;
+  y_vel_controller.kP = 200.0; // set to reach 0.25 max speed
+  y_vel_controller.kI = 0.0;
+  y_vel_controller.kD = 0.0;
+  y_vel_controller.constraint = 30.0;
+  y_vel_controller.enableConstraint = true;
 
   z_controller.kP = 30.0;
   z_controller.kI = 1.0;
@@ -853,6 +907,14 @@ void initialize_controllers() {
   z_controller.bias = 7.0;
   z_controller.constraint = 15.0;
   z_controller.enableConstraint = true;
+
+  x_controller.kP = 0.8;
+  x_controller.constraint = 0.29; // set 15% over true velocity target of 0.25
+  x_controller.enableConstraint = true;
+
+  y_controller.kP = 0.8;
+  y_controller.constraint = 0.29; // set 15% over true velocity target of 0.25
+  y_controller.enableConstraint = true;
 
   roll_controller.kP = 0.1;
   roll_controller.kD = 0.025;
@@ -903,27 +965,30 @@ void update_pids(float dt) {
   yaw_controller.update(yaw, dt);
   pitch_controller.update(pitch, dt);
   roll_controller.update(roll, dt);
-  float theta = yaw * M_PI / 180;
-  float delta_x = x - x_setpoint;
-  float delta_y = y - y_setpoint;
-  x_controller.update(delta_x*cos(theta) + delta_y*sin(theta), dt);
-  y_controller.update(-delta_x*sin(theta) + delta_y*cos(theta), dt);
+  x_controller.update(x, dt);
+  y_controller.update(y, dt);
+  x_vel_controller.setpoint = x_controller.output;
+  y_vel_controller.setpoint = y_controller.output;
+  x_vel_controller.update(vel_x, dt);
+  y_vel_controller.update(vel_y, dt);
   z_controller.update(z, dt);
 }
 
 void update_control_vector() {
+  float theta = yaw * M_PI / 180;
+
   if (x_mode == ControllerMode::EFFORT) {
     control_vector[0] = x_effort;
   }
   else {
-    control_vector[0] = x_controller.output;
+    control_vector[0] = x_vel_controller.output*cos(theta) + y_vel_controller.output*sin(theta);
   }
 
   if (y_mode == ControllerMode::EFFORT) {
     control_vector[1] = y_effort;
   }
   else {
-    control_vector[1] = y_controller.output;
+    control_vector[1] = -x_vel_controller.output*sin(theta) + y_vel_controller.output*cos(theta);
   }
 
   if (z_mode == ControllerMode::EFFORT) {
@@ -981,6 +1046,19 @@ void control_ball_dropper() {
         case 2: ball_dropper.write(45); break; // right ball
         default: break;
     }
+}
+
+void control_gripper(uint32_t loop_time_millis) {
+  if(loop_time_millis > last_grip_msg_ms + grip_hold_ms)
+  {
+    last_grip_msg_ms = loop_time_millis;
+    return;
+  }
+  switch(gripper_msg.data) {
+      case 0: gripper.write(1200); break;
+      case 1: gripper.write(1800); break;
+      default: break;
+  }
 }
 
 void output_to_pwm(uint32_t loop_time_millis) {
